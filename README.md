@@ -1,5 +1,7 @@
 # Virtual Microphone Array – Room Simulation
-This repository contains tools for simulating **virtual microphones and beamformers** in room environments using [Pyroomacoustics](https://github.com/LCAV/pyroomacoustics). It supports reproducible experiments for the AES 2025 paper on room response correction.
+This repository contains tools for simulating **virtual microphones and beamformers** in room environments using [Pyroomacoustics](https://github.com/LCAV/pyroomacoustics). It supports reproducible experiments for the AES 2025 paper "Room Acoustics Optimisation Using Virtual Microphone Arrays" by Brian de Brit, Prof Gavin Kearney and Dr David Dorran.
+
+Code written by Brian de Brit.
 
 ## Features
 - Room simulation with configurable microphone array geometry  
@@ -9,6 +11,7 @@ This repository contains tools for simulating **virtual microphones and beamform
 - Example WAV inputs under `test_files/`  
 
 ## Repository Structure
+~~~bash
 vma-room-sim/
 ├─ src/ # Core Python modules
 ├─ test_files/
@@ -16,16 +19,20 @@ vma-room-sim/
 ├─ virtual-mic-sim.yml # Conda environment for reproducibility
 ├─ .gitignore
 └─ README.md
+~~~
 
 ## Quick Start
 ### 1. Clone the repo
-```bash
+~~~bash
 git clone https://github.com/bdebrit/vma-room-sim.git
 cd vma-room-sim
+~~~
 
 ### 2. Create the environment
+~~~bash
 conda env create -f virtual-mic-sim.yml
 conda activate virtual-mic-sim
+~~~
 
 ### 3. Run simulation
 
@@ -54,13 +61,14 @@ MIT License (see LICENSE)
 ## Citation
 
 If you use this repository in academic work, please cite the AES 2025 paper:
-
+~~~bibtex
 @inproceedings{debrit2025vma,
   author = {de Brit, Brian},
-  title  = {Virtual Microphone Array Room Response Correction ...},
+  title  = {Room Acoustics Optimisation Using Virtual Microphone Arrays},
   booktitle = {AES Europe 2025},
   year = {2025}
 }
+~~~
 
 ## Roadmap
 
