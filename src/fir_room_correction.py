@@ -138,7 +138,7 @@ class FIRCorrectionFilter:
         right = lfilter(self.h_right, [1.0], stereo_audio[:, 1])
         return np.stack([left, right], axis=-1)
 
-    def export(self, mode="Unknown", directory="../test_files/bin"):
+    def export(self, mode="Unknown", directory="test_files/bin"):
         if mode == "Unknown":
             print("Unkown FIR method, load aborted.")
             exit(1)
@@ -149,7 +149,7 @@ class FIRCorrectionFilter:
         print(f"✅ FIR filters exported: {left_path}, {right_path}")
 
 
-    def load(self, mode="Unknown", directory="../test_files/bin"):
+    def load(self, mode="Unknown", directory="test_files/bin"):
 
         if mode == "Unknown":
             print("Unkown FIR method, load aborted.")

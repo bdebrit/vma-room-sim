@@ -108,8 +108,8 @@ class VirtualMicTest:
         left_path = f"fir_left_{mode}.npy"
         right_path = f"fir_right_{mode}.npy"
 
-        left_path = "../test_files/bin/" + left_path
-        right_path = "../test_files/bin/" + right_path
+        left_path = "test_files/bin/" + left_path
+        right_path = "test_files/bin/" + right_path
 
         # Load or train FIR filters
         if os.path.exists(left_path) and os.path.exists(right_path):
@@ -419,7 +419,7 @@ class VirtualMicTest:
 
         # Save to CSV
         if csv_path is None:
-            csv_path = f"../test_files/csv/fir_evaluation_metrics_{mode}.csv"
+            csv_path = f"test_files/csv/fir_evaluation_metrics_{mode}.csv"
         os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
         df.to_csv(csv_path, index=False)
         print(f"✅ Evaluation metrics saved to: {csv_path}")
@@ -524,7 +524,7 @@ class VirtualMicTest:
 
         # Save clipped version
         if csv_path is None:
-            csv_path = f"../test_files/csv/fir_eval_clipped_{mode}.csv"
+            csv_path = f"test_files/csv/fir_eval_clipped_{mode}.csv"
         os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
         df.to_csv(csv_path, index=False)
         print(f"✅ Clipped evaluation metrics saved to: {csv_path}")
