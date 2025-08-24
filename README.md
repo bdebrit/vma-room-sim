@@ -29,6 +29,10 @@ cd vma-room-sim
 ~~~
 
 ### 2. Create the environment
+This assumes that Anaconda or Miniconda is installed on your machine.
+
+From a bash terminal/command prompt, run:
+
 ~~~bash
 conda env create -f virtual-mic-sim.yml
 conda activate virtual-mic-sim
