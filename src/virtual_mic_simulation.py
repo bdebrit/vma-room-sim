@@ -29,7 +29,6 @@ import pickle
 import seaborn as sns
 import matplotlib.patches as mpatches
 from mpl_toolkits.mplot3d import art3d
-from fir_room_correction import FIRCorrectionFilter
 from virtual_mic_test import VirtualMicTest
 
 class VirtualMicSimulation:

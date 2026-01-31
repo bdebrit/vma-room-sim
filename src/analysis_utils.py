@@ -14,25 +14,6 @@ import pickle
 from sklearn.metrics import mean_squared_error
 from scipy.signal import chirp
 from numpy import angle, unwrap
-def coerce_stereo_2xN(signal):
-    """
-    Coerce audio signal into shape (2, N).
-
-    Accepts:
-      - mono (N,) -> duplicated to (2, N)
-      - stereo (2, N) -> unchanged
-      - stereo (N, 2) -> transposed
-    """
-    sig = np.asarray(signal)
-    if sig.ndim == 1:
-        return np.stack([sig, sig], axis=0)
-    if sig.ndim == 2:
-        if sig.shape[0] == 2:
-            return sig
-        if sig.shape[1] == 2:
-            return sig.T
-    raise ValueError(f"Expected mono (N,), stereo (2,N) or (N,2); got shape {sig.shape}")
-
 
 
 def summarize_rankings(dataset, fs, room_dims, room_positions, csv_path="test_files/csv/ranking_all_permutations.csv", include_columns=None):
@@ -134,13 +115,31 @@ def summarize_rankings(dataset, fs, room_dims, room_positions, csv_path="test_fi
 
 
 
-def add_stereo_signal(room, stereo_signal, fs, left_pos, right_pos):
-    """Adds two mono sources (L/R) from a stereo signal."""
-    stereo = coerce_stereo_2xN(stereo_signal)
-    room.add_source(position=left_pos, signal=stereo[0], delay=0.0)
-    room.add_source(position=right_pos, signal=stereo[1], delay=0.0)
+def _coerce_stereo_to_2xN(stereo_signal: np.ndarray) -> np.ndarray:
+    """Return stereo as shape (2, N). Accepts (2, N) or (N, 2)."""
+    stereo_signal = np.asarray(stereo_signal)
+    if stereo_signal.ndim != 2:
+        raise ValueError(f"Expected stereo signal with 2 dims, got shape {stereo_signal.shape}")
+    if stereo_signal.shape[0] == 2:
+        return stereo_signal
+    if stereo_signal.shape[1] == 2:
+        return stereo_signal.T
+    raise ValueError(f"Expected stereo signal with shape (2, N) or (N, 2), got {stereo_signal.shape}")
 
-def run_all_room_mic_tests(vms, room_dims, test_signal, dataset_checkpoint_path): 
+
+def add_stereo_signal(room, stereo_signal, fs, left_pos, right_pos):
+    """
+    Adds two mono sources (left and right) from a stereo signal at specified positions.
+
+    Accepts stereo_signal as either:
+      - shape (2, N)
+      - shape (N, 2)
+    """
+    stereo_2n = _coerce_stereo_to_2xN(stereo_signal)
+    room.add_source(position=left_pos, signal=stereo_2n[0], delay=0.0)
+    room.add_source(position=right_pos, signal=stereo_2n[1], delay=0.0)
+
+def run_all_room_mic_tests(vms, room_dims, test_signal, dataset_checkpoint_path, use_reflections=True, absorption=0.3, max_order_reflections=5): 
     """
     Run all room-style simulations over method, geometry, radius, num_mics.
     Evaluates each configuration at 5 reference mic positions: 1 center + 4 perimeter.
@@ -222,9 +221,10 @@ def run_all_room_mic_tests(vms, room_dims, test_signal, dataset_checkpoint_path)
         index_by_config[base_label] = []
 
         for i, ref_position in enumerate(eval_positions):
-            room = vms.create_simulation_room(room_dims, fs, absorption=0.3, max_order=5)
+            max_order = 0 if not use_reflections else max_order_reflections
+            room = vms.create_simulation_room(room_dims, fs, absorption=absorption, max_order=max_order)
 
-            add_stereo_signal(room, signal_stereo[0], fs, source_positions[0], source_positions[1])
+            add_stereo_signal(room, signal_stereo, fs, source_positions[0], source_positions[1])
             room.add_microphone_array(pra.MicrophoneArray(mic_positions, fs))
             room.add_microphone_array(pra.MicrophoneArray(np.array(ref_position).reshape(3, 1), fs))
 
@@ -1227,164 +1227,668 @@ def save_signal_to_wav(filename, signal, fs=48000):
     
     write(filename, fs, signal)
 
-def run_phase_a_monte_carlo(
+# ============================================================
+# Phase B: validate top-K Phase A random spherical (4) layouts
+# ============================================================
+
+def generate_random_spherical_geometry(center, radius, num_mics=4, seed=0):
+    """Generate `num_mics` random points uniformly on a sphere of given radius.
+
+    Returns array shape (3, N), consistent with pyroomacoustics MicrophoneArray.
+    """
+    rng = np.random.default_rng(int(seed))
+    u = rng.random(num_mics)
+    v = rng.random(num_mics)
+    theta = 2 * np.pi * u
+    phi = np.arccos(2 * v - 1)
+    x = np.sin(phi) * np.cos(theta)
+    y = np.sin(phi) * np.sin(theta)
+    z = np.cos(phi)
+    pts = np.vstack([x, y, z]) * float(radius)
+    center = np.asarray(center).reshape(3, 1)
+    return pts + center
+
+
+def compute_geometry_quality_metrics(mic_positions_3xN):
+    """Simple geometry metrics for analysis/plots."""
+    mp = np.asarray(mic_positions_3xN)
+    if mp.shape[0] != 3:
+        mp = mp.T
+    N = mp.shape[1]
+
+    dists = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            dists.append(np.linalg.norm(mp[:, i] - mp[:, j]))
+    dists = np.array(dists) if len(dists) else np.array([0.0])
+
+    X = mp - np.mean(mp, axis=1, keepdims=True)
+    C = X @ X.T / max(N, 1)
+    evals = np.linalg.eigvalsh(C)
+    evals = np.sort(np.maximum(evals, 1e-12))
+    spread_eig_ratio = float(evals[-1] / evals[0])
+
+    z_range = float(np.max(mp[2, :]) - np.min(mp[2, :]))
+
+    return {
+        "min_pairwise_dist": float(np.min(dists)),
+        "mean_pairwise_dist": float(np.mean(dists)),
+        "spread_eig_ratio": spread_eig_ratio,
+        "z_range": z_range,
+    }
+
+
+def select_top_draws_per_method_from_summary_csv(
+    phase_a_summary_csv_path,
+    top_k=10,
+    sort_col="combined_score",
+    geometry_filter=("spherical_uniform", "spherical_random", "spherical"),
+    num_mics_filter=4,
+):
+    """Select top-K draw IDs per method from Phase A summary CSV."""
+    df = pd.read_csv(phase_a_summary_csv_path)
+
+    if "draw" not in df.columns:
+        print("⚠️ Phase A summary CSV has no 'draw' column; cannot select random draws.")
+        return {}
+
+    if geometry_filter is not None and "geometry" in df.columns:
+        df = df[df["geometry"].isin(list(geometry_filter))]
+
+    if num_mics_filter is not None and "num_mics" in df.columns:
+        df = df[df["num_mics"] == num_mics_filter]
+
+    if sort_col not in df.columns:
+        raise KeyError(f"Expected '{sort_col}' column in Phase A CSV: {phase_a_summary_csv_path}")
+
+    top_by_method = {}
+    for method, g in df.groupby("method"):
+        gg = g.groupby("draw")[sort_col].mean().reset_index().sort_values(sort_col, ascending=True)
+        top_by_method[method] = [int(x) for x in gg.head(int(top_k))["draw"].tolist()]
+    return top_by_method
+
+
+def run_phase_b_validation(
     vms,
     room_dims,
-    test_signal,
-    dataset_checkpoint_path,
-    num_draws=200,
+    test_signals,
+    phase_a_summary_csv_path,
+    dataset_checkpoint_path="test_files/bin/checkpoint_phase_b.pkl",
+    top_k=10,
     seed=0,
     radius=0.25,
     method_list=None,
     use_reflections=False,
     absorption=0.3,
-    eval_radius=1.0
+    max_order_reflections=5,
+    eval_radius=1.0,
+    include_uniform_4=True,
+    mic_jitter_std_m=0.0,
+    resume_if_checkpoint_exists=True,
 ):
-    """
-    Phase A: Monte Carlo comparison of random 4-mic spherical layouts vs tetrahedral (4 mics).
-    - Uses the same 5 evaluation positions (centre + 4 around circle) as run_all_room_mic_tests.
-    - Saves results to dataset_checkpoint_path and writes ranking_all_permutations.csv.
+    """Phase B: validate Phase A top-K random spherical(4) layouts vs baselines.
 
-    Parameters:
-        vms: VirtualMicSimulation instance
-        room_dims: [x, y, z]
-        test_signal: ndarray or wav path. If ndarray may be mono (N,), stereo (2,N) or (N,2).
-        dataset_checkpoint_path: output pickle path
-        num_draws: number of random spherical layouts to sample
-        seed: base RNG seed (draw k uses seed+k)
-        radius: mic array radius
-        method_list: list of beamforming methods
-        use_reflections: False -> max_order=0
-        absorption: wall absorption coefficient
-        eval_radius: radius for evaluation positions around the reference mic
-
-    Returns:
-        summary_df, ranking_df
+    - Uses Phase A summary CSV to choose top-K `draw` IDs per method.
+    - For each signal + method, evaluates:
+        tetrahedral(4), (optional) spherical_uniform(4), and spherical_random(4) for each selected draw.
+    - Evaluates at 5 ref positions (centre + ring) from `get_room_evaluation_positions`.
+    - Saves checkpoint FIRST, then writes CSV outputs (so a plotting/CSV crash won't lose the run).
+    - If `resume_if_checkpoint_exists` is True and the checkpoint exists, it will skip simulation and only postprocess.
     """
     fs = 48000
-    method_list = method_list or ['mvdr', 'delay_sum_time', 'delay_sum_freq']
-    audio_format = "stereo"
+    if method_list is None:
+        method_list = ['mvdr', 'delay_sum_time', 'delay_sum_freq']
+
+    # If we already have a checkpoint, don't rerun sims; just postprocess
+    if resume_if_checkpoint_exists and os.path.exists(dataset_checkpoint_path):
+        print(f"🔁 Phase B: found existing checkpoint at {dataset_checkpoint_path} — postprocessing only.")
+        room_positions = vms.get_room_style_positions(room_dims)
+        include_cols = [
+            "signal_name","method","num_mics","geometry","mic_array_order","audio_channel_format","radius","draw",
+            "min_pairwise_dist","mean_pairwise_dist","spread_eig_ratio","z_range"
+        ]
+        postprocess_phase_b_checkpoint(
+            dataset_checkpoint_path,
+            fs=fs,
+            room_dims=room_dims,
+            room_positions=room_positions,
+            out_dir="test_files/csv/phase_b",
+            include_columns=include_cols,
+        )
+        return {"skipped_simulation": True}
+
+    # Normalize signals to (2, N)
+    signals_2n = {name: _coerce_stereo_to_2xN(sig) for name, sig in test_signals.items()}
 
     room_positions = vms.get_room_style_positions(room_dims)
     mic_array_centre = room_positions['mic_array_centre']
     source_positions = room_positions['source_positions']
     eval_positions = vms.get_room_evaluation_positions(room_positions['ref_mic_pos'], radius=eval_radius)
 
-    # Load/generate stereo signal (2, N)
-    if isinstance(test_signal, str) and test_signal.lower().endswith('.wav'):
-        signal_data, file_fs = sf.read(test_signal)
-        if file_fs != fs:
-            raise ValueError(f"Expected {fs} Hz, got {file_fs}")
-        if signal_data.ndim == 1:
-            signal_stereo = np.stack([signal_data, signal_data], axis=0)
-        else:
-            signal_stereo = coerce_stereo_2xN(signal_data)
-    elif isinstance(test_signal, np.ndarray):
-        signal_stereo = coerce_stereo_2xN(test_signal)
-    else:
-        raise TypeError("test_signal must be a WAV file path or a NumPy array")
+    top_draws_by_method = select_top_draws_per_method_from_summary_csv(
+        phase_a_summary_csv_path,
+        top_k=top_k,
+        sort_col="combined_score",
+        geometry_filter=("spherical_uniform", "spherical_random", "spherical"),
+        num_mics_filter=4
+    )
 
-    # Always regenerate for Phase A (avoids confusion with older checkpoints)
     dataset = {}
-    index_by_config = {}
+    meta = {
+        "fs": fs,
+        "room_dims": room_dims,
+        "room_positions": room_positions,
+        "phase": "B",
+        "use_reflections": bool(use_reflections),
+        "absorption": float(absorption),
+        "eval_radius": float(eval_radius),
+        "radius": float(radius),
+        "top_k": int(top_k),
+        "method_list": list(method_list),
+        "signals": list(signals_2n.keys()),
+    }
 
-    # Fixed baseline: tetrahedral 4 mics
-    baseline_geoms = [('tetrahedral', 4, None)]  # (geom, num_mics, draw_id)
-    # Random spherical: num_draws different layouts
-    random_geoms = [('spherical_random', 4, d) for d in range(num_draws)]
+    def build_configs_for_method(method):
+        configs = [("tetrahedral", 4, None)]
+        if include_uniform_4:
+            configs.append(("spherical_uniform", 4, None))
+        for draw_id in top_draws_by_method.get(method, []):
+            configs.append(("spherical_random", 4, int(draw_id)))
 
-    all_configs = baseline_geoms + random_geoms
+        # Deduplicate
+        uniq = []
+        seen = set()
+        for c in configs:
+            if c not in seen:
+                uniq.append(c)
+                seen.add(c)
+        return uniq
 
-
-    for geom, num_mics, draw_id in tqdm(all_configs, desc="Phase A configs"):
-        array_order = vms.estimate_array_order(geom, num_mics)
-        draw_tag = f"draw={draw_id}" if draw_id is not None else "draw=baseline"
-
+    # Run simulations
+    for signal_name, stereo_2n in signals_2n.items():
         for method in method_list:
-            base_label = (
-                f"geometry={geom},method={method},radius={radius},num_mics={num_mics},"
-                f"mic_array_order={array_order},array=room_fixed,audio_channel_format={audio_format},{draw_tag}"
-            )
-            index_by_config[base_label] = []
+            configs = build_configs_for_method(method)
+            for geom, num_mics, draw_id in tqdm(configs, desc=f"Phase B ({signal_name}) configs"):
+                # Mic geometry
+                if geom == "spherical_random":
+                    mic_positions = generate_random_spherical_geometry(
+                        mic_array_centre, radius, num_mics=num_mics, seed=seed + int(draw_id)
+                    )
+                else:
+                    mic_positions = vms.generate_array_geometry(mic_array_centre, geom, radius, num_mics)
 
-            # Seed only affects spherical_random
-            geom_seed = (seed + int(draw_id)) if (geom == 'spherical_random' and draw_id is not None) else None
-            mic_positions = vms.generate_array_geometry(mic_array_centre, geom, radius, num_mics, seed=geom_seed)
+                # Optional jitter
+                if mic_jitter_std_m and mic_jitter_std_m > 0:
+                    rng = np.random.default_rng(seed + (int(draw_id) if draw_id is not None else 0))
+                    mic_positions = mic_positions + rng.normal(0.0, mic_jitter_std_m, size=mic_positions.shape)
 
-            for i, ref_position in enumerate(eval_positions):
-                room = vms.create_simulation_room(
-                    room_dims, fs, absorption=absorption, max_order=5, use_reflections=use_reflections
-                )
+                array_order = vms.estimate_array_order(geom, num_mics) if hasattr(vms, "estimate_array_order") else None
+                geom_metrics = compute_geometry_quality_metrics(mic_positions)
 
-                add_stereo_signal(room, signal_stereo, fs, source_positions[0], source_positions[1])
+                for i, ref_position in enumerate(eval_positions):
+                    base_label = (
+                        f"signal_name={signal_name},geometry={geom},method={method},radius={radius},num_mics={num_mics},"
+                        f"mic_array_order={array_order},array=room_fixed,audio_channel_format=stereo"
+                    )
+                    if draw_id is not None:
+                        base_label += f",draw={int(draw_id)}"
 
-                # Array mics
-                room.add_microphone_array(pra.MicrophoneArray(mic_positions, fs))
-                # Reference mic at the evaluation position
-                room.add_microphone_array(pra.MicrophoneArray(np.array(ref_position).reshape(3, 1), fs))
+                    label = base_label + f",ref_mic_position=room_pos{i}"
 
-                room.compute_rir()
-                room.simulate()
+                    max_order = 0 if not use_reflections else max_order_reflections
+                    room = vms.create_simulation_room(room_dims, fs, absorption=absorption, max_order=max_order)
 
-                ref_signal = room.mic_array.signals[-1]
-                virtual_signal = vms.compute_virtual_microphone(
-                    room, method, np.array(ref_position), mic_positions
-                )[:len(ref_signal)]
+                    add_stereo_signal(room, stereo_2n, fs, source_positions[0], source_positions[1])
+                    room.add_microphone_array(pra.MicrophoneArray(mic_positions, fs))
+                    room.add_microphone_array(pra.MicrophoneArray(np.array(ref_position).reshape(3, 1), fs))
 
-                label = f"{base_label},ref=room_pos{i}"
-                index_by_config[base_label].append(label)
+                    room.compute_rir()
+                    room.simulate()
 
-                dataset[label] = {
-                    'ref': ref_signal,
-                    'virtual': virtual_signal,
-                    'audio_channel_format': audio_format,
-                    'geometry': geom,
-                    'method': method,
-                    'radius': radius,
-                    'num_mics': num_mics,
-                    'mic_array_order': array_order,
-                    'ref_position': ref_position,
-                    'src_position': source_positions,
-                    'ref_mic_position': f'room_pos{i}',
-                    'mic_array_position': 'room_fixed',
-                    'draw': draw_id
-                }
+                    ref_signal = room.mic_array.signals[-1]
+                    virtual_signal = vms.compute_virtual_microphone(room, method, np.array(ref_position), mic_positions)
 
-    # Summarize
-    summary_df = summarize_metrics_table(
-        dataset,
-        metric_fn=compute_time_domain_error,
-        sort_by='combined_score',
-        ascending=True,
-        round_digits=3,
-        csv_path=None
-    )
+                    dataset[label] = {
+                        "ref": ref_signal,
+                        "virtual": virtual_signal,
+                        "audio_channel_format": "stereo",
+                        "geometry": geom,
+                        "method": method,
+                        "radius": float(radius),
+                        "num_mics": int(num_mics),
+                        "mic_array_order": array_order,
+                        "ref_position": ref_position,
+                        "src_position": source_positions,
+                        "ref_mic_position": f"room_pos{i}",
+                        "mic_array_position": "room_fixed",
+                        "signal_name": signal_name,
+                        "draw": int(draw_id) if draw_id is not None else -1,
+                        **geom_metrics,
+                    }
 
-    ranking_df = summarize_rankings(
-        dataset, fs, room_dims, room_positions,
-        csv_path="test_files/csv/ranking_all_permutations.csv",
-        include_columns=['method', 'num_mics', 'geometry', 'mic_array_order', 'audio_channel_format', 'radius', 'draw']
-    )
+                # Save incrementally (protect long runs)
+                if len(dataset) and (len(dataset) % 25 == 0):
+                    ensure_parent_dir(dataset_checkpoint_path)
+                    with open(dataset_checkpoint_path, "wb") as f:
+                        pickle.dump({"dataset": dataset, "meta": meta}, f)
 
-    os.makedirs(os.path.dirname(dataset_checkpoint_path), exist_ok=True)
+    # Save checkpoint BEFORE post-processing
+    ensure_parent_dir(dataset_checkpoint_path)
     with open(dataset_checkpoint_path, "wb") as f:
-        pickle.dump({
-            'dataset': dataset,
-            'ranking_df': ranking_df,
-            'room_dims': room_dims,
-            'signal_stereo': signal_stereo,
-            'fs': fs,
-            'index_by_config': index_by_config,
-            'phase_a': {
-                'num_draws': num_draws,
-                'seed': seed,
-                'radius': radius,
-                'methods': method_list,
-                'use_reflections': use_reflections,
-                'absorption': absorption,
-                'eval_radius': eval_radius
-            }
-        }, f)
+        pickle.dump({"dataset": dataset, "meta": meta}, f)
+    print(f"✅ Phase B checkpoint saved to {dataset_checkpoint_path}")
 
-    print(f"✅ Phase A checkpoint saved to {dataset_checkpoint_path}")
-    return summary_df, ranking_df
+    include_cols = [
+        "signal_name","method","num_mics","geometry","mic_array_order","audio_channel_format","radius","draw",
+        "min_pairwise_dist","mean_pairwise_dist","spread_eig_ratio","z_range"
+    ]
+    postprocess_phase_b_checkpoint(
+        dataset_checkpoint_path,
+        fs=fs,
+        room_dims=room_dims,
+        room_positions=room_positions,
+        out_dir="test_files/csv/phase_b",
+        include_columns=include_cols,
+    )
+
+    return {"skipped_simulation": False}
+
+
+
+# ============================================================
+# Utilities (missing in some versions)
+# ============================================================
+
+def ensure_parent_dir(path: str) -> None:
+    """Ensure the parent directory of a file path exists."""
+    if path is None:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def postprocess_phase_b_checkpoint(
+    checkpoint_path: str,
+    fs: int,
+    room_dims,
+    room_positions: dict,
+    out_dir: str = "test_files/csv/phase_b",
+    include_columns=None,
+):
+    """Load Phase B checkpoint and write summary + ranking CSVs.
+
+    Expected checkpoint format:
+        {"dataset": dict, "meta": dict}
+
+    Outputs:
+        - {out_dir}/summary_per_position_phase_b.csv
+        - {out_dir}/ranking_phase_b.csv
+
+    Returns:
+        ranking_df (pd.DataFrame)
+    """
+    ensure_parent_dir(os.path.join(out_dir, "dummy.txt"))
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(checkpoint_path, "rb") as f:
+        ckpt = pickle.load(f)
+
+    dataset = ckpt.get("dataset", ckpt)  # tolerate older formats
+
+    records = []
+    mac = np.array(room_positions.get("mic_array_centre", [0, 0, 0]), dtype=float)
+
+    for label, data in tqdm(dataset.items(), total=len(dataset), desc="Phase B postprocess", unit="entry"):
+        ref = data["ref"]
+        vm = data["virtual"]
+
+        snr_db = compute_snr(ref, vm)
+        freq_err_db = compute_freq_error(ref, vm, fs)
+        _, phase_err = compute_phase_error(ref, vm, fs, n_fft=1024)
+
+        phase_err_scalar = float(np.mean(np.abs(phase_err)))
+        combined = compute_combined_error_score(snr_db, freq_err_db, phase_err_scalar)
+
+        ref_pos = np.array(data.get("ref_position", [np.nan, np.nan, np.nan]), dtype=float)
+        if ref_pos.shape == (3,) and np.all(np.isfinite(ref_pos)):
+            euclid = float(np.linalg.norm(ref_pos - mac))
+        else:
+            euclid = np.nan
+
+        rec = {
+            "label": label,
+            "signal_name": data.get("signal_name", "unknown"),
+            "method": data.get("method", "unknown"),
+            "geometry": data.get("geometry", "unknown"),
+            "num_mics": data.get("num_mics", np.nan),
+            "radius": data.get("radius", np.nan),
+            "mic_array_order": data.get("mic_array_order", np.nan),
+            "audio_channel_format": data.get("audio_channel_format", "stereo"),
+            "draw": data.get("draw", data.get("draw_id", -1)),
+            "ref_mic_position": data.get("ref_mic_position", "room_pos?"),
+            "mic_array_position": data.get("mic_array_position", "room_fixed"),
+            "euclidean_distance": euclid,
+            "min_pairwise_dist": data.get("min_pairwise_dist", np.nan),
+            "mean_pairwise_dist": data.get("mean_pairwise_dist", np.nan),
+            "spread_eig_ratio": data.get("spread_eig_ratio", np.nan),
+            "z_range": data.get("z_range", np.nan),
+            "snr_db": float(np.round(snr_db, 3)),
+            "freq_error_db": float(np.round(freq_err_db, 3)),
+            "phase_error_rad": float(np.round(phase_err_scalar, 3)),
+            "combined_score": float(np.round(combined, 6)),
+        }
+        records.append(rec)
+
+
+    summary_df = pd.DataFrame(records)
+
+    # Save per-position summary
+    summary_csv = os.path.join(out_dir, "summary_per_position_phase_b.csv")
+    summary_df.to_csv(summary_csv, index=False)
+
+    # Group/rank across the 5 reference positions
+    if include_columns is None:
+        group_cols = [
+            "signal_name", "method", "geometry", "num_mics", "radius", "mic_array_order",
+            "audio_channel_format", "draw",
+            "min_pairwise_dist", "mean_pairwise_dist", "spread_eig_ratio", "z_range",
+        ]
+    else:
+        group_cols = [c for c in include_columns if c in summary_df.columns]
+        if "signal_name" in summary_df.columns and "signal_name" not in group_cols:
+            group_cols.insert(0, "signal_name")
+
+    # Avoid pandas collision: don't group by a column you also aggregate
+    if "euclidean_distance" in group_cols:
+        group_cols = [c for c in group_cols if c != "euclidean_distance"]
+
+
+    agg = summary_df.groupby(group_cols, dropna=False).agg(
+        snr_db=("snr_db", "mean"),
+        freq_error_db=("freq_error_db", "mean"),
+        phase_error_rad=("phase_error_rad", "mean"),
+        combined_score=("combined_score", "mean"),
+        euclidean_distance=("euclidean_distance", "mean"),
+    ).reset_index()
+
+    agg = agg.sort_values("combined_score", ascending=True).reset_index(drop=True)
+    agg["rank"] = np.arange(1, len(agg) + 1)
+
+    for c in ["snr_db", "freq_error_db", "phase_error_rad", "combined_score", "euclidean_distance"]:
+        if c in agg.columns:
+            agg[c] = agg[c].astype(float).round(3)
+
+    ranking_csv = os.path.join(out_dir, "ranking_phase_b.csv")
+    agg.to_csv(ranking_csv, index=False)
+
+    print(f"✅ Phase B postprocess wrote:\n  - {summary_csv}\n  - {ranking_csv}")
+    return agg
+
+
+# ============================================================
+# Phase B plotting helpers
+# ============================================================
+
+def plot_best_freq_phase_errors_by_geometry(
+    ranking_df: pd.DataFrame,
+    out_dir: str = "graphs/phase_b",
+    by_method: bool = True,
+    show: bool = True,
+    save_png: bool = True,
+):
+    """Plot best (lowest) frequency and phase errors per geometry.
+
+    Uses the *ranked* Phase B table (e.g., ranking_phase_b.csv already loaded to ranking_df)
+    that contains mean-over-positions metrics such as:
+      - freq_error_db
+      - phase_error_rad
+
+    If by_method=True, produces one figure per method for freq and phase.
+    If by_method=False, produces one figure (aggregated across methods).
+    """
+    if ranking_df is None or len(ranking_df) == 0:
+        print("⚠️ plot_best_freq_phase_errors_by_geometry: ranking_df is empty.")
+        return
+
+    required_cols = {"geometry", "freq_error_db", "phase_error_rad"}
+    missing = required_cols - set(ranking_df.columns)
+    if missing:
+        raise ValueError(f"ranking_df missing required columns: {sorted(missing)}")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _label_row(r):
+        g = str(r.get("geometry", "unknown"))
+        d = r.get("draw", None)
+        # Draw might be float in CSV
+        try:
+            d_int = int(float(d))
+        except Exception:
+            d_int = None
+        if d_int is None or d_int < 0:
+            return f"{g} (baseline)"
+        return f"{g} (draw={d_int})"
+
+    def _plot_one(sub: pd.DataFrame, metric: str, title: str, fname: str):
+        s = sub.sort_values(metric, ascending=True)
+        xlabels = [_label_row(r) for _, r in s.iterrows()]
+        y = s[metric].astype(float).values
+
+        plt.figure(figsize=(11, 4))
+        plt.bar(range(len(y)), y)
+        plt.xticks(range(len(y)), xlabels, rotation=15, ha="right")
+        plt.ylabel(metric)
+        plt.title(title)
+        plt.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+
+        if save_png:
+            plt.savefig(os.path.join(out_dir, fname), dpi=200, bbox_inches="tight")
+        if show:
+            plt.show(block=False)
+        else:
+            plt.close()
+
+    if by_method and "method" in ranking_df.columns:
+        for method in sorted(ranking_df["method"].dropna().unique()):
+            dfm = ranking_df[ranking_df["method"] == method].copy()
+
+            # Best per geometry for each metric
+            best_freq = dfm.sort_values("freq_error_db", ascending=True).groupby("geometry", as_index=False).first()
+            best_phase = dfm.sort_values("phase_error_rad", ascending=True).groupby("geometry", as_index=False).first()
+
+            _plot_one(
+                best_freq,
+                "freq_error_db",
+                title=f"Phase B: Best (lowest) frequency magnitude error by geometry | method={method}",
+                fname=f"phase_b_best_freq_error__{method}.png",
+            )
+            _plot_one(
+                best_phase,
+                "phase_error_rad",
+                title=f"Phase B: Best (lowest) phase error by geometry | method={method}",
+                fname=f"phase_b_best_phase_error__{method}.png",
+            )
+    else:
+        best_freq = ranking_df.sort_values("freq_error_db", ascending=True).groupby("geometry", as_index=False).first()
+        best_phase = ranking_df.sort_values("phase_error_rad", ascending=True).groupby("geometry", as_index=False).first()
+
+        _plot_one(
+            best_freq,
+            "freq_error_db",
+            title="Phase B: Best (lowest) frequency magnitude error by geometry (all methods)",
+            fname="phase_b_best_freq_error__all_methods.png",
+        )
+        _plot_one(
+            best_phase,
+            "phase_error_rad",
+            title="Phase B: Best (lowest) phase error by geometry (all methods)",
+            fname="phase_b_best_phase_error__all_methods.png",
+        )
+
+    print(f"✅ Saved Phase B best-metric plots to: {out_dir}")
+
+def plot_phase_b_best_error_spectra(
+    checkpoint_path: str,
+    ranking_csv_path: str,
+    out_dir: str = "graphs/phase_b_spectra",
+    fs: int = 48000,
+    by_method: bool = True,
+    ref_positions=("room_pos0", "room_pos1", "room_pos2", "room_pos3", "room_pos4"),
+    f_min: float = 20.0,
+    f_max: float = 20000.0,
+    fft_size: int = 32768,
+    n_fft_phase: int = 1024,
+    show: bool = True,
+    save_png: bool = True,
+):
+    """
+    Plot Phase B spectrum error curves for the BEST config per geometry (optionally per method).
+
+    Requires:
+      - Phase B checkpoint (.pkl) containing raw 'ref' and 'virtual' signals per config/position
+      - Phase B ranking CSV (ranking_phase_b.csv) to decide which configs are "best"
+
+    Produces:
+      - magnitude error spectrum (dB) averaged across 5 ref positions
+      - phase error spectrum (rad) averaged across 5 ref positions
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    rank = pd.read_csv(ranking_csv_path)
+
+    with open(checkpoint_path, "rb") as f:
+        ckpt = pickle.load(f)
+    dataset = ckpt.get("dataset", ckpt)
+
+    # ---- helper: try to find a checkpoint entry robustly ----
+    def _match_draw(d_draw, csv_draw):
+        # tolerate float/int/str inconsistencies
+        try:
+            return int(float(d_draw)) == int(float(csv_draw))
+        except Exception:
+            return str(d_draw) == str(csv_draw)
+
+    def find_entry(method, geometry, draw, ref_pos_name):
+        # Preferred: field-based matching
+        for d in dataset.values():
+            if d.get("method") != method:
+                continue
+            if d.get("geometry") != geometry:
+                continue
+
+            d_draw = d.get("draw", d.get("draw_id", None))
+            if d_draw is not None and not _match_draw(d_draw, draw):
+                continue
+
+            # ref position naming can differ between pipelines
+            ref_name = d.get("ref_mic_position", None)
+            if ref_name not in (ref_pos_name, f"ref={ref_pos_name}"):
+                continue
+
+            if "ref" in d and "virtual" in d:
+                return d
+
+        # Fallback: key-string matching
+        for label, d in dataset.items():
+            if (f"method={method}" in str(label) and f"geometry={geometry}" in str(label)
+                and f"ref={ref_pos_name}" in str(label) and ("ref" in d and "virtual" in d)):
+                # draw might be missing for baselines; try to match if present
+                if f"draw={draw}" in str(label) or ("draw" not in str(label) and pd.isna(draw)):
+                    return d
+
+        raise KeyError(
+            f"Could not find checkpoint entry for method={method}, geometry={geometry}, draw={draw}, ref={ref_pos_name}"
+        )
+
+    # Decide how we pick “best”
+    group_cols = ["geometry"] + (["method"] if by_method else [])
+    best_rows = (
+        rank.sort_values("combined_score", ascending=True)
+            .groupby(group_cols, as_index=False)
+            .first()
+    )
+
+    print("\nBest rows chosen for spectrum plots:")
+    print(best_rows[group_cols + ["draw", "combined_score", "freq_error_db", "phase_error_rad"]])
+
+    # ---- plot each best config ----
+    for _, row in best_rows.iterrows():
+        method = row["method"] if by_method else rank["method"].iloc[0]
+        geometry = row["geometry"]
+        draw = row.get("draw", np.nan)
+
+        mag_err_list = []
+        phase_err_list = []
+        freqs_mag = None
+        freqs_phase = None
+
+        for rp in ref_positions:
+            d = find_entry(method, geometry, draw, rp)
+
+            ref = np.asarray(d["ref"]).reshape(-1)
+            vm = np.asarray(d["virtual"]).reshape(-1)
+
+            freqs_mag, mag_err = compute_freq_error_spectrum(ref, vm, fs, fft_size=fft_size)
+            freqs_phase, phase_err = compute_phase_error(ref, vm, fs, n_fft=n_fft_phase)
+
+            mag_err_list.append(mag_err)
+            phase_err_list.append(phase_err)
+
+        mag_err_mean = np.mean(np.vstack(mag_err_list), axis=0)
+        phase_err_mean = np.mean(np.vstack(phase_err_list), axis=0)
+
+        # Labels
+        if pd.isna(draw):
+            draw_tag = "baseline"
+        else:
+            try:
+                draw_tag = f"draw_{int(float(draw))}"
+            except Exception:
+                draw_tag = f"draw_{draw}"
+
+        name_tag = f"{method}__{geometry}__{draw_tag}"
+
+        # Magnitude error spectrum
+        plt.figure(figsize=(12, 4))
+        plt.plot(freqs_mag, mag_err_mean, label="Mean over 5 positions")
+        plt.xlim(f_min, f_max)
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Magnitude error (dB)")
+        plt.title(f"Phase B magnitude error | {method} | {geometry} | {draw_tag}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+
+        if save_png:
+            mag_path = os.path.join(out_dir, f"mag_error__{name_tag}.png")
+            plt.savefig(mag_path, dpi=200)
+        if show:
+            plt.show(block=False)
+        else:
+            plt.close()
+
+        # Phase error spectrum
+        plt.figure(figsize=(12, 4))
+        plt.plot(freqs_phase, phase_err_mean, label="Mean over 5 positions")
+        plt.xlim(f_min, f_max)
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Phase error (rad)")
+        plt.title(f"Phase B phase error | {method} | {geometry} | {draw_tag}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+
+        if save_png:
+            ph_path = os.path.join(out_dir, f"phase_error__{name_tag}.png")
+            plt.savefig(ph_path, dpi=200)
+        if show:
+            plt.show(block=False)
+        else:
+            plt.close()
+
+        if save_png:
+            print(f"✅ Saved spectra:\n  {mag_path}\n  {ph_path}")
+
